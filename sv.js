@@ -8,7 +8,6 @@ import { webcrypto as crypto } from 'node:crypto';
 const PORT = process.env.PORT || 3000;
 const STREAM_SECRET = process.env.STREAM_SECRET || ''; // PHẢI trùng với STREAM_SECRET bên sv1
 const DEBUG = process.env.DEBUG === 'true';
-const IS_FREE_PLAN = false;
 
 const FALLBACK_URL = process.env.FALLBACK_URL
   || 'https://huggingface.co/datasets/hiepp2/tvp4/resolve/main/xnxx.mp4';
@@ -28,23 +27,7 @@ process.on('unhandledRejection', (reason) => {
 });
 
 
-// ============================================
-// CẤU HÌNH TỐI ƯU THEO DUNG LƯỢNG FILE (giữ nguyên logic gốc)
-// ============================================
-function getDynamicConfig(totalFileSize) {
-  const GB = 1024 * 1024 * 1024;
-
-  if (IS_FREE_PLAN) {
-    return { chunkSize: 2 * 1024 * 1024, concurrency: 2, maxSubrequests: 40 };
-  }
-  if (!totalFileSize || totalFileSize < 1 * GB) {
-    return { chunkSize: 2 * 1024 * 1024, concurrency: 3, maxSubrequests: 113000 };
-  }
-  if (totalFileSize <= 10 * GB) {
-    return { chunkSize: 3 * 1024 * 1024, concurrency: 4, maxSubrequests: 122000 };
-  }
-  return { chunkSize: 6 * 1024 * 1024, concurrency: 4, maxSubrequests: 136000 };
-}
+// (Đã bỏ getDynamicConfig/chunk-splitting — xem giải thích ở phần PROXY PASS-THROUGH bên dưới)
 
 // ============================================
 // XÁC MINH CHỮ KÝ (giống hệt thuật toán bên sv1 generateStreamUrl)
@@ -88,7 +71,12 @@ async function verifyStreamSig(filename, searchParams) {
 }
 
 // ============================================
-// PROXY 206 (giữ nguyên logic gốc, chỉ đổi cách trả response cho Node http)
+// PROXY PASS-THROUGH — 1 lệnh fetch duy nhất, KHÔNG tách chunk/tải song song.
+// (Cơ chế tách chunk cũ được thiết kế riêng để né giới hạn subrequest của
+// Cloudflare Workers — không cần thiết trên Node.js/Railway, và chính là
+// nguyên nhân RAM tăng vọt khi nhiều người xem cùng lúc: mỗi người giữ 3-4
+// buffer 2-6MB trong RAM cùng lúc. Giờ mỗi kết nối chỉ giữ 1 stream đang
+// chảy qua, RAM gần như không phụ thuộc dung lượng file hay số người xem.)
 // ============================================
 
 async function proxyDynamic206(targetUrl, req) {
@@ -97,118 +85,20 @@ async function proxyDynamic206(targetUrl, req) {
     'X-Xet-Cas-Uid': 'public'
   };
   const clientRange = req.headers['range'];
+  const headers = { ...baseHeadersObj };
+  if (clientRange) headers.Range = clientRange;
 
-  let headResp = await fetch(targetUrl, { method: 'HEAD', headers: baseHeadersObj, redirect: 'follow' });
-  if (!headResp.ok || !headResp.headers.get('content-length')) {
-    headResp = await fetch(targetUrl, { method: 'GET', headers: { ...baseHeadersObj, Range: 'bytes=0-0' }, redirect: 'follow' });
+  const resp = await fetch(targetUrl, { method: 'GET', headers, redirect: 'follow' });
+
+  if (!resp.ok && resp.status !== 206) {
+    resp.body?.cancel().catch(() => {});
+    return { status: 404, statusText: 'Not Found', headers: new Headers(), text: 'Target file not found' };
   }
 
-  const finalUrl = headResp.url || targetUrl;
-
-  let totalFileSize = 0;
-  const contentRange = headResp.headers.get('content-range');
-  if (contentRange) {
-    const match = contentRange.match(/\/(\d+)/);
-    if (match) totalFileSize = parseInt(match[1], 10);
-  }
-  if (!totalFileSize) {
-    const contentLength = headResp.headers.get('content-length');
-    if (contentLength) totalFileSize = parseInt(contentLength, 10);
-  }
-
-  const { chunkSize, concurrency, maxSubrequests } = getDynamicConfig(totalFileSize);
-
-  let startByte = 0;
-  let endByte = totalFileSize > 0 ? totalFileSize - 1 : 0;
-
-  if (clientRange) {
-    const rangeMatch = clientRange.match(/bytes=(\d+)-(\d+)?/);
-    if (rangeMatch) {
-      startByte = parseInt(rangeMatch[1], 10);
-      if (rangeMatch[2]) {
-        endByte = parseInt(rangeMatch[2], 10);
-      } else if (totalFileSize > startByte) {
-        endByte = totalFileSize - 1;
-      }
-    }
-  }
-
-  const maxAllowedBytes = startByte + (maxSubrequests * chunkSize) - 1;
-  if (endByte > maxAllowedBytes) endByte = maxAllowedBytes;
-
-  const requestedSize = Math.max(0, (endByte - startByte) + 1);
-
-  const { readable, writable } = new TransformStream();
-
-  (async () => {
-    try {
-      const totalChunks = Math.ceil(requestedSize / chunkSize);
-      let nextChunkToFetch = 0;
-      let nextChunkToWrite = 0;
-      const pendingFetches = new Map();
-      const HARD_CAP_PER_CHUNK = chunkSize * 2;
-
-      const launchFetch = (chunkIndex) => {
-        const chunkStart = startByte + chunkIndex * chunkSize;
-        if (chunkStart > endByte) return null;
-        const chunkEnd = Math.min(chunkStart + chunkSize - 1, endByte);
-        const headers = { ...baseHeadersObj, Range: `bytes=${chunkStart}-${chunkEnd}` };
-
-        return fetch(finalUrl, { headers, method: 'GET', redirect: 'follow' }).then(res => {
-          if (res.status !== 206) {
-            res.body?.cancel().catch(() => {});
-            throw new Error(`Origin không trả 206 cho chunk #${chunkIndex} (status ${res.status})`);
-          }
-          const declaredLen = parseInt(res.headers.get('content-length') || '0', 10);
-          if (declaredLen && declaredLen > HARD_CAP_PER_CHUNK) {
-            res.body?.cancel().catch(() => {});
-            throw new Error(`Chunk #${chunkIndex} content-length vượt giới hạn an toàn`);
-          }
-          return res;
-        });
-      };
-
-      const drainToWriter = async (res, chunkIndex) => {
-        try {
-          await res.body.pipeTo(writable, { preventClose: true });
-        } catch (err) {
-          throw new Error(`Lỗi khi pipe chunk #${chunkIndex}: ${err.message}`);
-        }
-      };
-
-      while (nextChunkToFetch < concurrency && nextChunkToFetch < totalChunks) {
-        pendingFetches.set(nextChunkToFetch, launchFetch(nextChunkToFetch));
-        nextChunkToFetch++;
-      }
-
-      while (nextChunkToWrite < totalChunks) {
-        const currentPromise = pendingFetches.get(nextChunkToWrite);
-        if (!currentPromise) break;
-
-        const res = await currentPromise;
-        pendingFetches.delete(nextChunkToWrite);
-
-        if (nextChunkToFetch < totalChunks) {
-          pendingFetches.set(nextChunkToFetch, launchFetch(nextChunkToFetch));
-          nextChunkToFetch++;
-        }
-
-        await drainToWriter(res, nextChunkToWrite);
-        nextChunkToWrite++;
-      }
-    } catch (err) {
-      if (DEBUG) console.warn(`[PIPELINE ABORTED] ${err.message}`);
-    } finally {
-      try { await writable.close(); } catch (_) {}
-    }
-  })();
-
-  const responseHeaders = buildResponseHeaders(headResp.headers, targetUrl);
+  const responseHeaders = buildResponseHeaders(resp.headers, targetUrl);
   responseHeaders.set('Accept-Ranges', 'bytes');
-  responseHeaders.set('Content-Range', `bytes ${startByte}-${endByte}/${totalFileSize || '*'}`);
-  responseHeaders.set('Content-Length', requestedSize.toString());
 
-  return { status: 206, statusText: 'Partial Content', headers: responseHeaders, webStream: readable };
+  return { status: resp.status, statusText: resp.statusText, headers: responseHeaders, webStream: resp.body };
 }
 
 async function fetchStandard(targetUrl, headers, originalUrl) {
