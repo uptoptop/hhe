@@ -1,13 +1,11 @@
 import http from 'node:http';
 import { Readable } from 'node:stream';
 import { webcrypto as crypto } from 'node:crypto';
-import Redis from 'ioredis';
 
 // ============================================
 // CẤU HÌNH
 // ============================================
 const PORT = process.env.PORT || 3000;
-const REDIS_URL = process.env.REDIS_URL; // Railway tự cấp khi bạn add plugin Redis
 const STREAM_SECRET = process.env.STREAM_SECRET || ''; // PHẢI trùng với STREAM_SECRET bên sv1
 const DEBUG = process.env.DEBUG === 'true';
 const IS_FREE_PLAN = false;
@@ -16,25 +14,9 @@ const FALLBACK_URL = process.env.FALLBACK_URL
   || 'https://huggingface.co/datasets/hiepp2/tvp4/resolve/main/xnxx.mp4';
 
 const STREAM_SIG_HEX_LEN = 32;
-const MAX_IPS_PER_LINK = 2;         // 1 link ký được dùng tối đa bởi 2 IP khác nhau (đổi wifi <-> 4G)
-const LINK_LOCK_MIN_TTL = 60;       // TTL tối thiểu ghi vào Redis (giây)
-const RATE_LIMIT_WINDOW_SEC = 10;   // Cửa sổ rate-limit
-const RATE_LIMIT_MAX = 20;          // Tối đa 20 request / 10s / IP
 
 if (!STREAM_SECRET && DEBUG) {
   console.warn('[WARN] STREAM_SECRET chưa được cấu hình — mọi request sẽ bị từ chối.');
-}
-
-const redis = REDIS_URL ? new Redis(REDIS_URL, { maxRetriesPerRequest: 3 }) : null;
-if (!redis) {
-  console.warn('[WARN] REDIS_URL chưa được cấu hình — rate-limit và khoá IP sẽ bị bỏ qua (không chặn).');
-} else {
-  // BẮT BUỘC: nếu không gắn listener cho 'error', Node sẽ crash toàn bộ process
-  // ngay khi Redis mất kết nối / cấu hình sai. Đây là nguyên nhân phổ biến khiến
-  // Railway báo "Service offline" dù build thành công.
-  redis.on('error', (err) => {
-    console.error(`[REDIS ERROR] ${err.message}`);
-  });
 }
 
 // Lưới an toàn cuối cùng: log lỗi thay vì để process chết đột ngột.
@@ -43,51 +25,6 @@ process.on('uncaughtException', (err) => {
 });
 process.on('unhandledRejection', (reason) => {
   console.error('[UNHANDLED REJECTION]', reason);
-});
-
-// ============================================
-// LUA SCRIPT (ATOMIC) — chống race condition khi traffic cao.
-// Toàn bộ "đọc -> kiểm tra -> ghi" chạy gọn trong 1 lệnh duy nhất trên Redis,
-// không thể bị 2 request chen ngang giữa chừng như khi tách GET/SET riêng.
-// ============================================
-
-// Rate-limit: INCR + set TTL lần đầu, tất cả trong 1 lệnh atomic.
-redis?.defineCommand('rateLimitHit', {
-  numberOfKeys: 1,
-  lua: `
-    local current = redis.call('INCR', KEYS[1])
-    if tonumber(current) == 1 then
-      redis.call('EXPIRE', KEYS[1], ARGV[1])
-    end
-    return current
-  `
-});
-
-// Khoá IP theo link: đọc danh sách IP hiện tại, kiểm tra + thêm IP mới (nếu còn chỗ),
-// ghi lại — tất cả trong 1 lệnh atomic, không có khoảng hở giữa đọc và ghi.
-redis?.defineCommand('lockIpForLink', {
-  numberOfKeys: 1,
-  lua: `
-    local raw = redis.call('GET', KEYS[1])
-    local ips = {}
-    if raw then
-      ips = cjson.decode(raw)
-    end
-
-    for i, v in ipairs(ips) do
-      if v == ARGV[1] then
-        return 1
-      end
-    end
-
-    if #ips >= tonumber(ARGV[2]) then
-      return 0
-    end
-
-    table.insert(ips, ARGV[1])
-    redis.call('SET', KEYS[1], cjson.encode(ips), 'EX', tonumber(ARGV[3]))
-    return 1
-  `
 });
 
 
@@ -148,47 +85,6 @@ async function verifyStreamSig(filename, searchParams) {
   const expectedSig = Array.from(new Uint8Array(expectedBytes)).map(b => b.toString(16).padStart(2, '0')).join('').slice(0, STREAM_SIG_HEX_LEN);
 
   return { valid: safeEqualHex(sig.toLowerCase(), expectedSig), expPlain };
-}
-
-// ============================================
-// CHỐNG SHARE LINK / SPAM THEO IP (Redis)
-// ============================================
-
-function getClientIp(req) {
-  const xff = req.headers['x-forwarded-for'];
-  if (xff) return xff.split(',')[0].trim();
-  return req.socket?.remoteAddress || 'unknown';
-}
-
-async function checkIpRateLimit(ip) {
-  if (!redis) return true;
-  try {
-    // Atomic: INCR + EXPIRE (lần đầu) gộp trong 1 lệnh -> không có khoảng hở race condition
-    const count = await redis.rateLimitHit(`rate:${ip}`, RATE_LIMIT_WINDOW_SEC);
-    return count <= RATE_LIMIT_MAX;
-  } catch (err) {
-    if (DEBUG) console.warn(`[RATE LIMIT ERROR] ${err.message}`);
-    return true; // lỗi hạ tầng thì không chặn nhầm user hợp lệ
-  }
-}
-
-async function checkAndLockIp(sig, ip, expPlain) {
-  if (!redis) return true;
-  const key = `lock:${sig}`;
-  const ttl = Math.max(LINK_LOCK_MIN_TTL, expPlain - Math.floor(Date.now() / 1000));
-
-  try {
-    // Atomic: đọc + kiểm tra + ghi gộp trong 1 lệnh Lua -> không thể bị 2 IP chen ngang
-    // giữa lúc đọc và ghi (khác với get()+set() tách rời trước đây).
-    const result = await redis.lockIpForLink(key, ip, MAX_IPS_PER_LINK, ttl);
-    if (result === 0 && DEBUG) {
-      console.warn(`[IP LOCK] Link bị share vượt giới hạn ${MAX_IPS_PER_LINK} IP: ${key}`);
-    }
-    return result === 1;
-  } catch (err) {
-    if (DEBUG) console.warn(`[IP LOCK ERROR] ${err.message}`);
-    return true;
-  }
 }
 
 // ============================================
@@ -396,31 +292,13 @@ const server = http.createServer(async (req, res) => {
     }
 
     const filename = fullFilename.split('.')[0];
-    const clientIp = getClientIp(req);
 
-    // 1. Verify chữ ký phim/4k do sv1 tạo
+    // Chỉ chấp nhận request có chữ ký "phim" + "4k" hợp lệ do sv1 tạo ra.
     const sigCheck = await verifyStreamSig(filename, url.searchParams);
     if (!sigCheck.valid) {
-      if (DEBUG) console.warn(`[SIG REJECTED] ${filename} | IP: ${clientIp}`);
+      if (DEBUG) console.warn(`[SIG REJECTED] ${filename}`);
       res.writeHead(403);
       res.end('Forbidden: invalid or missing signature');
-      return;
-    }
-
-    // 2. Rate limit theo IP
-    const withinRateLimit = await checkIpRateLimit(clientIp);
-    if (!withinRateLimit) {
-      res.writeHead(429, { 'Retry-After': '10' });
-      res.end('Too Many Requests');
-      return;
-    }
-
-    // 3. Khoá link theo IP (chống share)
-    const sigParam = url.searchParams.get('phim');
-    const ipAllowed = await checkAndLockIp(sigParam, clientIp, sigCheck.expPlain);
-    if (!ipAllowed) {
-      res.writeHead(403);
-      res.end('Forbidden: link has been used from too many locations');
       return;
     }
 
