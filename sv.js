@@ -29,7 +29,7 @@ process.on('unhandledRejection', (reason) => {
 
 
 // ============================================
-// CẤU HÌNH TỐI ƯU THEO DUNG LƯỢNG FILE (giữ nguyên logic gốc)
+// CẤU HÌNH TỐI ƯU THEO DUNG LƯỢNG FILE
 // ============================================
 function getDynamicConfig(totalFileSize) {
   const GB = 1024 * 1024 * 1024;
@@ -47,7 +47,7 @@ function getDynamicConfig(totalFileSize) {
 }
 
 // ============================================
-// XÁC MINH CHỮ KÝ (giống hệt thuật toán bên sv1 generateStreamUrl)
+// XÁC MINH CHỮ KÝ
 // ============================================
 
 function safeEqualHex(left, right) {
@@ -58,7 +58,7 @@ function safeEqualHex(left, right) {
 }
 
 /**
- * Trả về { valid, expPlain }. expPlain dùng để tính TTL khoá IP bên dưới.
+ * Trả về { valid, expPlain }.
  */
 async function verifyStreamSig(filename, searchParams) {
   const sig = searchParams.get('phim');
@@ -88,19 +88,19 @@ async function verifyStreamSig(filename, searchParams) {
 }
 
 // ============================================
-// PROXY 206 (giữ nguyên logic gốc, chỉ đổi cách trả response cho Node http)
+// PROXY 206 (ĐÃ THÊM ABORT SIGNAL CHỐNG LEAK RAM)
 // ============================================
 
-async function proxyDynamic206(targetUrl, req) {
+async function proxyDynamic206(targetUrl, req, signal) {
   const baseHeadersObj = {
     'User-Agent': 'huggingface_hub/0.25.0 hf-xet/0.1.0 python/3.10',
     'X-Xet-Cas-Uid': 'public'
   };
   const clientRange = req.headers['range'];
 
-  let headResp = await fetch(targetUrl, { method: 'HEAD', headers: baseHeadersObj, redirect: 'follow' });
+  let headResp = await fetch(targetUrl, { method: 'HEAD', headers: baseHeadersObj, redirect: 'follow', signal });
   if (!headResp.ok || !headResp.headers.get('content-length')) {
-    headResp = await fetch(targetUrl, { method: 'GET', headers: { ...baseHeadersObj, Range: 'bytes=0-0' }, redirect: 'follow' });
+    headResp = await fetch(targetUrl, { method: 'GET', headers: { ...baseHeadersObj, Range: 'bytes=0-0' }, redirect: 'follow', signal });
   }
 
   const finalUrl = headResp.url || targetUrl;
@@ -141,6 +141,7 @@ async function proxyDynamic206(targetUrl, req) {
   const { readable, writable } = new TransformStream();
 
   (async () => {
+    const writer = writable.getWriter();
     try {
       const totalChunks = Math.ceil(requestedSize / chunkSize);
       let nextChunkToFetch = 0;
@@ -154,7 +155,7 @@ async function proxyDynamic206(targetUrl, req) {
         const chunkEnd = Math.min(chunkStart + chunkSize - 1, endByte);
         const headers = { ...baseHeadersObj, Range: `bytes=${chunkStart}-${chunkEnd}` };
 
-        return fetch(finalUrl, { headers, method: 'GET', redirect: 'follow' }).then(res => {
+        return fetch(finalUrl, { headers, method: 'GET', redirect: 'follow', signal }).then(res => {
           if (res.status !== 206) {
             res.body?.cancel().catch(() => {});
             throw new Error(`Origin không trả 206 cho chunk #${chunkIndex} (status ${res.status})`);
@@ -169,26 +170,35 @@ async function proxyDynamic206(targetUrl, req) {
       };
 
       const drainToWriter = async (res, chunkIndex) => {
+        if (!res || !res.body) return;
+        const reader = res.body.getReader();
         try {
-          await res.body.pipeTo(writable, { preventClose: true });
-        } catch (err) {
-          throw new Error(`Lỗi khi pipe chunk #${chunkIndex}: ${err.message}`);
+          while (true) {
+            if (signal.aborted) throw new Error('Client aborted process');
+            const { done, value } = await reader.read();
+            if (done) break;
+            await writer.write(value);
+          }
+        } finally {
+          reader.releaseLock();
         }
       };
 
       while (nextChunkToFetch < concurrency && nextChunkToFetch < totalChunks) {
+        if (signal.aborted) break;
         pendingFetches.set(nextChunkToFetch, launchFetch(nextChunkToFetch));
         nextChunkToFetch++;
       }
 
       while (nextChunkToWrite < totalChunks) {
+        if (signal.aborted) break;
         const currentPromise = pendingFetches.get(nextChunkToWrite);
         if (!currentPromise) break;
 
         const res = await currentPromise;
         pendingFetches.delete(nextChunkToWrite);
 
-        if (nextChunkToFetch < totalChunks) {
+        if (nextChunkToFetch < totalChunks && !signal.aborted) {
           pendingFetches.set(nextChunkToFetch, launchFetch(nextChunkToFetch));
           nextChunkToFetch++;
         }
@@ -199,7 +209,12 @@ async function proxyDynamic206(targetUrl, req) {
     } catch (err) {
       if (DEBUG) console.warn(`[PIPELINE ABORTED] ${err.message}`);
     } finally {
-      try { await writable.close(); } catch (_) {}
+      // Dọn dẹp dứt điểm các fetch promise còn đọng lại
+      for (const [_, p] of pendingFetches) {
+        p.then(res => res?.body?.cancel().catch(() => {})).catch(() => {});
+      }
+      pendingFetches.clear();
+      try { await writer.close(); } catch (_) {}
     }
   })();
 
@@ -211,8 +226,8 @@ async function proxyDynamic206(targetUrl, req) {
   return { status: 206, statusText: 'Partial Content', headers: responseHeaders, webStream: readable };
 }
 
-async function fetchStandard(targetUrl, headers, originalUrl) {
-  const resp = await fetch(targetUrl, { headers, method: 'GET', redirect: 'follow' });
+async function fetchStandard(targetUrl, headers, originalUrl, signal) {
+  const resp = await fetch(targetUrl, { headers, method: 'GET', redirect: 'follow', signal });
   if (!resp.ok && resp.status !== 206) {
     return { status: 404, statusText: 'Not Found', headers: new Headers(), text: 'Target file not found' };
   }
@@ -247,23 +262,46 @@ function getDownloadFilename(targetUrl) {
 }
 
 // ============================================
-// HTTP SERVER (Node) — thay cho export default { fetch } của Cloudflare
+// HTTP SERVER (NODE) — ĐÃ BỔ SUNG LẮNG NGHE CLIENT CLOSE
 // ============================================
 
-function sendWebResult(res, result) {
+function sendWebResult(res, result, signal) {
   res.writeHead(result.status, result.statusText, Object.fromEntries(result.headers.entries()));
   if (result.text !== undefined) {
     res.end(result.text);
     return;
   }
   if (result.webStream) {
-    Readable.fromWeb(result.webStream).pipe(res);
+    const nodeStream = Readable.fromWeb(result.webStream);
+    
+    // Hủy Stream ngay lập tức nếu Abort Signal được bật
+    const onAbort = () => {
+      nodeStream.destroy();
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+
+    nodeStream.on('end', () => {
+      signal.removeEventListener('abort', onAbort);
+    });
+
+    nodeStream.pipe(res);
     return;
   }
   res.end();
 }
 
 const server = http.createServer(async (req, res) => {
+  // Tạo Controller riêng cho mỗi Client Request
+  const abortController = new AbortController();
+  const { signal } = abortController;
+
+  // Khi Client tua / đóng trình duyệt -> hủy ngay các fetch ngầm
+  req.on('close', () => {
+    if (!res.writableEnded) {
+      abortController.abort();
+    }
+  });
+
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
 
@@ -293,7 +331,7 @@ const server = http.createServer(async (req, res) => {
 
     const filename = fullFilename.split('.')[0];
 
-    // Chỉ chấp nhận request có chữ ký "phim" + "4k" hợp lệ do sv1 tạo ra.
+    // Xác minh chữ ký phim + 4k
     const sigCheck = await verifyStreamSig(filename, url.searchParams);
     if (!sigCheck.valid) {
       if (DEBUG) console.warn(`[SIG REJECTED] ${filename}`);
@@ -305,7 +343,7 @@ const server = http.createServer(async (req, res) => {
     const apiUrl = `https://f.apip4k.dpdns.org/xl.php?${filename}`;
     let targetUrl;
     try {
-      const apiResp = await fetch(apiUrl);
+      const apiResp = await fetch(apiUrl, { signal });
       if (!apiResp.ok) {
         targetUrl = FALLBACK_URL;
       } else {
@@ -322,20 +360,24 @@ const server = http.createServer(async (req, res) => {
       targetUrl = FALLBACK_URL;
     }
 
+    if (signal.aborted) return;
+
     try {
-      const result = await proxyDynamic206(targetUrl, req);
-      sendWebResult(res, result);
+      const result = await proxyDynamic206(targetUrl, req, signal);
+      sendWebResult(res, result, signal);
     } catch (err) {
+      if (signal.aborted) return;
       if (DEBUG) console.error(`[PROXY ERROR] ${err.message}`);
       const fallbackHeaders = {
         'User-Agent': 'huggingface_hub/0.25.0 hf-xet/0.1.0 python/3.10',
         'X-Xet-Cas-Uid': 'public'
       };
       if (req.headers['range']) fallbackHeaders.Range = req.headers['range'];
-      const result = await fetchStandard(targetUrl, fallbackHeaders, targetUrl);
-      sendWebResult(res, result);
+      const result = await fetchStandard(targetUrl, fallbackHeaders, targetUrl, signal);
+      sendWebResult(res, result, signal);
     }
   } catch (err) {
+    if (signal.aborted) return;
     console.error(`[SERVER ERROR] ${err.stack || err.message}`);
     if (!res.headersSent) {
       res.writeHead(500);
