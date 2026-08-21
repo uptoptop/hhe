@@ -25,10 +25,25 @@ if (!STREAM_SECRET && DEBUG) {
   console.warn('[WARN] STREAM_SECRET chưa được cấu hình — mọi request sẽ bị từ chối.');
 }
 
-const redis = REDIS_URL ? new Redis(REDIS_URL) : null;
+const redis = REDIS_URL ? new Redis(REDIS_URL, { maxRetriesPerRequest: 3 }) : null;
 if (!redis) {
   console.warn('[WARN] REDIS_URL chưa được cấu hình — rate-limit và khoá IP sẽ bị bỏ qua (không chặn).');
+} else {
+  // BẮT BUỘC: nếu không gắn listener cho 'error', Node sẽ crash toàn bộ process
+  // ngay khi Redis mất kết nối / cấu hình sai. Đây là nguyên nhân phổ biến khiến
+  // Railway báo "Service offline" dù build thành công.
+  redis.on('error', (err) => {
+    console.error(`[REDIS ERROR] ${err.message}`);
+  });
 }
+
+// Lưới an toàn cuối cùng: log lỗi thay vì để process chết đột ngột.
+process.on('uncaughtException', (err) => {
+  console.error('[UNCAUGHT EXCEPTION]', err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[UNHANDLED REJECTION]', reason);
+});
 
 // ============================================
 // LUA SCRIPT (ATOMIC) — chống race condition khi traffic cao.
@@ -451,6 +466,6 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => {
+server.listen(PORT, '0.0.0.0', () => {
   console.log(`sv2 (Railway) đang chạy ở port ${PORT}`);
 });
