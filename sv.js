@@ -38,12 +38,12 @@ function getDynamicConfig(totalFileSize) {
     return { chunkSize: 2 * 1024 * 1024, concurrency: 5, maxSubrequests: 111140 };
   }
   if (!totalFileSize || totalFileSize < 1 * GB) {
-    return { chunkSize: 2 * 1024 * 1024, concurrency: 6, maxSubrequests: 113000 };
+    return { chunkSize: 4 * 1024 * 1024, concurrency: 8, maxSubrequests: 113000 };
   }
   if (totalFileSize <= 10 * GB) {
-    return { chunkSize: 4 * 1024 * 1024, concurrency: 7, maxSubrequests: 122000 };
+    return { chunkSize: 8 * 1024 * 1024, concurrency: 10, maxSubrequests: 122000 };
   }
-  return { chunkSize: 8 * 1024 * 1024, concurrency: 8, maxSubrequests: 136000 };
+  return { chunkSize: 10 * 1024 * 1024, concurrency: 12, maxSubrequests: 136000 };
 }
 
 // ============================================
