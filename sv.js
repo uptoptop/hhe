@@ -8,6 +8,7 @@ import { webcrypto as crypto } from 'node:crypto';
 const PORT = process.env.PORT || 3000;
 const STREAM_SECRET = process.env.STREAM_SECRET || ''; // PHẢI trùng với STREAM_SECRET bên sv1
 const DEBUG = process.env.DEBUG === 'true';
+const IS_FREE_PLAN = false;
 
 const FALLBACK_URL = process.env.FALLBACK_URL
   || 'https://huggingface.co/datasets/hiepp2/tvp4/resolve/main/xnxx.mp4';
@@ -26,36 +27,24 @@ process.on('unhandledRejection', (reason) => {
   console.error('[UNHANDLED REJECTION]', reason);
 });
 
-// ============================================
-// CACHE URL ĐÃ RESOLVE (in-memory, mỗi filename resolve 1 lần / TTL)
-// Nếu không cache, MỖI request Range mới từ trình phát (tua, buffer đoạn kế)
-// đều phải gọi lại API resolve trước khi fetch dữ liệu thật -> cộng dồn độ trễ
-// -> chính là nguyên nhân phổ biến gây giật/buffer liên tục khi xem.
-// ============================================
-const RESOLVE_CACHE_TTL_MS = 45 * 60 * 1000; // 45 phút, giống thiết kế gốc bên sv1
-const resolveCache = new Map(); // filename -> { url, expiresAt }
 
-function getCachedTargetUrl(filename) {
-  const entry = resolveCache.get(filename);
-  if (!entry) return null;
-  if (Date.now() > entry.expiresAt) {
-    resolveCache.delete(filename);
-    return null;
+// ============================================
+// CẤU HÌNH TỐI ƯU THEO DUNG LƯỢNG FILE (giữ nguyên logic gốc)
+// ============================================
+function getDynamicConfig(totalFileSize) {
+  const GB = 1024 * 1024 * 1024;
+
+  if (IS_FREE_PLAN) {
+    return { chunkSize: 2 * 1024 * 1024, concurrency: 2, maxSubrequests: 40 };
   }
-  return entry.url;
+  if (!totalFileSize || totalFileSize < 1 * GB) {
+    return { chunkSize: 2 * 1024 * 1024, concurrency: 3, maxSubrequests: 113000 };
+  }
+  if (totalFileSize <= 10 * GB) {
+    return { chunkSize: 3 * 1024 * 1024, concurrency: 4, maxSubrequests: 122000 };
+  }
+  return { chunkSize: 6 * 1024 * 1024, concurrency: 4, maxSubrequests: 136000 };
 }
-
-function setCachedTargetUrl(filename, url) {
-  resolveCache.set(filename, { url, expiresAt: Date.now() + RESOLVE_CACHE_TTL_MS });
-}
-
-function invalidateCachedTargetUrl(filename) {
-  resolveCache.delete(filename);
-}
-
-
-
-// (Đã bỏ getDynamicConfig/chunk-splitting — xem giải thích ở phần PROXY PASS-THROUGH bên dưới)
 
 // ============================================
 // XÁC MINH CHỮ KÝ (giống hệt thuật toán bên sv1 generateStreamUrl)
@@ -99,12 +88,7 @@ async function verifyStreamSig(filename, searchParams) {
 }
 
 // ============================================
-// PROXY PASS-THROUGH — 1 lệnh fetch duy nhất, KHÔNG tách chunk/tải song song.
-// (Cơ chế tách chunk cũ được thiết kế riêng để né giới hạn subrequest của
-// Cloudflare Workers — không cần thiết trên Node.js/Railway, và chính là
-// nguyên nhân RAM tăng vọt khi nhiều người xem cùng lúc: mỗi người giữ 3-4
-// buffer 2-6MB trong RAM cùng lúc. Giờ mỗi kết nối chỉ giữ 1 stream đang
-// chảy qua, RAM gần như không phụ thuộc dung lượng file hay số người xem.)
+// PROXY 206 (giữ nguyên logic gốc, chỉ đổi cách trả response cho Node http)
 // ============================================
 
 async function proxyDynamic206(targetUrl, req) {
@@ -113,20 +97,118 @@ async function proxyDynamic206(targetUrl, req) {
     'X-Xet-Cas-Uid': 'public'
   };
   const clientRange = req.headers['range'];
-  const headers = { ...baseHeadersObj };
-  if (clientRange) headers.Range = clientRange;
 
-  const resp = await fetch(targetUrl, { method: 'GET', headers, redirect: 'follow' });
-
-  if (!resp.ok && resp.status !== 206) {
-    resp.body?.cancel().catch(() => {});
-    return { status: 404, statusText: 'Not Found', headers: new Headers(), text: 'Target file not found' };
+  let headResp = await fetch(targetUrl, { method: 'HEAD', headers: baseHeadersObj, redirect: 'follow' });
+  if (!headResp.ok || !headResp.headers.get('content-length')) {
+    headResp = await fetch(targetUrl, { method: 'GET', headers: { ...baseHeadersObj, Range: 'bytes=0-0' }, redirect: 'follow' });
   }
 
-  const responseHeaders = buildResponseHeaders(resp.headers, targetUrl);
-  responseHeaders.set('Accept-Ranges', 'bytes');
+  const finalUrl = headResp.url || targetUrl;
 
-  return { status: resp.status, statusText: resp.statusText, headers: responseHeaders, webStream: resp.body };
+  let totalFileSize = 0;
+  const contentRange = headResp.headers.get('content-range');
+  if (contentRange) {
+    const match = contentRange.match(/\/(\d+)/);
+    if (match) totalFileSize = parseInt(match[1], 10);
+  }
+  if (!totalFileSize) {
+    const contentLength = headResp.headers.get('content-length');
+    if (contentLength) totalFileSize = parseInt(contentLength, 10);
+  }
+
+  const { chunkSize, concurrency, maxSubrequests } = getDynamicConfig(totalFileSize);
+
+  let startByte = 0;
+  let endByte = totalFileSize > 0 ? totalFileSize - 1 : 0;
+
+  if (clientRange) {
+    const rangeMatch = clientRange.match(/bytes=(\d+)-(\d+)?/);
+    if (rangeMatch) {
+      startByte = parseInt(rangeMatch[1], 10);
+      if (rangeMatch[2]) {
+        endByte = parseInt(rangeMatch[2], 10);
+      } else if (totalFileSize > startByte) {
+        endByte = totalFileSize - 1;
+      }
+    }
+  }
+
+  const maxAllowedBytes = startByte + (maxSubrequests * chunkSize) - 1;
+  if (endByte > maxAllowedBytes) endByte = maxAllowedBytes;
+
+  const requestedSize = Math.max(0, (endByte - startByte) + 1);
+
+  const { readable, writable } = new TransformStream();
+
+  (async () => {
+    try {
+      const totalChunks = Math.ceil(requestedSize / chunkSize);
+      let nextChunkToFetch = 0;
+      let nextChunkToWrite = 0;
+      const pendingFetches = new Map();
+      const HARD_CAP_PER_CHUNK = chunkSize * 2;
+
+      const launchFetch = (chunkIndex) => {
+        const chunkStart = startByte + chunkIndex * chunkSize;
+        if (chunkStart > endByte) return null;
+        const chunkEnd = Math.min(chunkStart + chunkSize - 1, endByte);
+        const headers = { ...baseHeadersObj, Range: `bytes=${chunkStart}-${chunkEnd}` };
+
+        return fetch(finalUrl, { headers, method: 'GET', redirect: 'follow' }).then(res => {
+          if (res.status !== 206) {
+            res.body?.cancel().catch(() => {});
+            throw new Error(`Origin không trả 206 cho chunk #${chunkIndex} (status ${res.status})`);
+          }
+          const declaredLen = parseInt(res.headers.get('content-length') || '0', 10);
+          if (declaredLen && declaredLen > HARD_CAP_PER_CHUNK) {
+            res.body?.cancel().catch(() => {});
+            throw new Error(`Chunk #${chunkIndex} content-length vượt giới hạn an toàn`);
+          }
+          return res;
+        });
+      };
+
+      const drainToWriter = async (res, chunkIndex) => {
+        try {
+          await res.body.pipeTo(writable, { preventClose: true });
+        } catch (err) {
+          throw new Error(`Lỗi khi pipe chunk #${chunkIndex}: ${err.message}`);
+        }
+      };
+
+      while (nextChunkToFetch < concurrency && nextChunkToFetch < totalChunks) {
+        pendingFetches.set(nextChunkToFetch, launchFetch(nextChunkToFetch));
+        nextChunkToFetch++;
+      }
+
+      while (nextChunkToWrite < totalChunks) {
+        const currentPromise = pendingFetches.get(nextChunkToWrite);
+        if (!currentPromise) break;
+
+        const res = await currentPromise;
+        pendingFetches.delete(nextChunkToWrite);
+
+        if (nextChunkToFetch < totalChunks) {
+          pendingFetches.set(nextChunkToFetch, launchFetch(nextChunkToFetch));
+          nextChunkToFetch++;
+        }
+
+        await drainToWriter(res, nextChunkToWrite);
+        nextChunkToWrite++;
+      }
+    } catch (err) {
+      if (DEBUG) console.warn(`[PIPELINE ABORTED] ${err.message}`);
+    } finally {
+      try { await writable.close(); } catch (_) {}
+    }
+  })();
+
+  const responseHeaders = buildResponseHeaders(headResp.headers, targetUrl);
+  responseHeaders.set('Accept-Ranges', 'bytes');
+  responseHeaders.set('Content-Range', `bytes ${startByte}-${endByte}/${totalFileSize || '*'}`);
+  responseHeaders.set('Content-Length', requestedSize.toString());
+
+  return { status: 206, statusText: 'Partial Content', headers: responseHeaders, webStream: readable };
 }
 
 async function fetchStandard(targetUrl, headers, originalUrl) {
@@ -220,48 +302,28 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // Resolve URL gốc — ưu tiên lấy từ cache để tránh cộng dồn độ trễ resolve
-    // trên MỖI request Range (video player gửi rất nhiều request khi phát/tua).
-    async function resolveTargetUrl() {
-      const cached = getCachedTargetUrl(filename);
-      if (cached) return cached;
-
-      const apiUrl = `https://f.apip4k.dpdns.org/xl.php?${filename}`;
-      try {
-        const apiResp = await fetch(apiUrl);
-        if (!apiResp.ok) return FALLBACK_URL;
-
+    const apiUrl = `https://f.apip4k.dpdns.org/xl.php?${filename}`;
+    let targetUrl;
+    try {
+      const apiResp = await fetch(apiUrl);
+      if (!apiResp.ok) {
+        targetUrl = FALLBACK_URL;
+      } else {
         const rawTargetUrl = (await apiResp.text()).trim();
-        if (!rawTargetUrl) return FALLBACK_URL;
-
-        const resolvedUrl = new URL(rawTargetUrl).toString();
-        setCachedTargetUrl(filename, resolvedUrl);
-        return resolvedUrl;
-      } catch (_) {
-        return FALLBACK_URL;
+        if (!rawTargetUrl) {
+          targetUrl = FALLBACK_URL;
+        } else {
+          const targetUrlObj = new URL(rawTargetUrl);
+          url.searchParams.forEach((value, key) => targetUrlObj.searchParams.set(key, value));
+          targetUrl = targetUrlObj.toString();
+        }
       }
-    }
-
-    let targetUrl = await resolveTargetUrl();
-    if (targetUrl !== FALLBACK_URL) {
-      const targetUrlObj = new URL(targetUrl);
-      url.searchParams.forEach((value, key) => targetUrlObj.searchParams.set(key, value));
-      targetUrl = targetUrlObj.toString();
+    } catch (_) {
+      targetUrl = FALLBACK_URL;
     }
 
     try {
       const result = await proxyDynamic206(targetUrl, req);
-
-      // Link cache bị chết (403/404) -> xoá cache, resolve lại URL mới, thử lại ngay
-      if (result.status === 403 || result.status === 404) {
-        if (DEBUG) console.warn(`[CACHE EXPIRED] Link chết cho ${filename}, resolve lại...`);
-        invalidateCachedTargetUrl(filename);
-        const freshUrl = await resolveTargetUrl();
-        const retryResult = await proxyDynamic206(freshUrl, req);
-        sendWebResult(res, retryResult);
-        return;
-      }
-
       sendWebResult(res, result);
     } catch (err) {
       if (DEBUG) console.error(`[PROXY ERROR] ${err.message}`);
