@@ -2,14 +2,11 @@
   "name": "sv2-railway",
   "version": "1.0.0",
   "type": "module",
-  "main": "server.js",
+  "main": "sv.js",
   "scripts": {
     "start": "node sv.js"
   },
   "engines": {
     "node": ">=18"
-  },
-  "dependencies": {
-    "ioredis": "^5.4.1"
   }
 }
