@@ -26,6 +26,34 @@ process.on('unhandledRejection', (reason) => {
   console.error('[UNHANDLED REJECTION]', reason);
 });
 
+// ============================================
+// CACHE URL ĐÃ RESOLVE (in-memory, mỗi filename resolve 1 lần / TTL)
+// Nếu không cache, MỖI request Range mới từ trình phát (tua, buffer đoạn kế)
+// đều phải gọi lại API resolve trước khi fetch dữ liệu thật -> cộng dồn độ trễ
+// -> chính là nguyên nhân phổ biến gây giật/buffer liên tục khi xem.
+// ============================================
+const RESOLVE_CACHE_TTL_MS = 45 * 60 * 1000; // 45 phút, giống thiết kế gốc bên sv1
+const resolveCache = new Map(); // filename -> { url, expiresAt }
+
+function getCachedTargetUrl(filename) {
+  const entry = resolveCache.get(filename);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) {
+    resolveCache.delete(filename);
+    return null;
+  }
+  return entry.url;
+}
+
+function setCachedTargetUrl(filename, url) {
+  resolveCache.set(filename, { url, expiresAt: Date.now() + RESOLVE_CACHE_TTL_MS });
+}
+
+function invalidateCachedTargetUrl(filename) {
+  resolveCache.delete(filename);
+}
+
+
 
 // (Đã bỏ getDynamicConfig/chunk-splitting — xem giải thích ở phần PROXY PASS-THROUGH bên dưới)
 
@@ -192,28 +220,48 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    const apiUrl = `https://f.apip4k.dpdns.org/xl.php?${filename}`;
-    let targetUrl;
-    try {
-      const apiResp = await fetch(apiUrl);
-      if (!apiResp.ok) {
-        targetUrl = FALLBACK_URL;
-      } else {
+    // Resolve URL gốc — ưu tiên lấy từ cache để tránh cộng dồn độ trễ resolve
+    // trên MỖI request Range (video player gửi rất nhiều request khi phát/tua).
+    async function resolveTargetUrl() {
+      const cached = getCachedTargetUrl(filename);
+      if (cached) return cached;
+
+      const apiUrl = `https://f.apip4k.dpdns.org/xl.php?${filename}`;
+      try {
+        const apiResp = await fetch(apiUrl);
+        if (!apiResp.ok) return FALLBACK_URL;
+
         const rawTargetUrl = (await apiResp.text()).trim();
-        if (!rawTargetUrl) {
-          targetUrl = FALLBACK_URL;
-        } else {
-          const targetUrlObj = new URL(rawTargetUrl);
-          url.searchParams.forEach((value, key) => targetUrlObj.searchParams.set(key, value));
-          targetUrl = targetUrlObj.toString();
-        }
+        if (!rawTargetUrl) return FALLBACK_URL;
+
+        const resolvedUrl = new URL(rawTargetUrl).toString();
+        setCachedTargetUrl(filename, resolvedUrl);
+        return resolvedUrl;
+      } catch (_) {
+        return FALLBACK_URL;
       }
-    } catch (_) {
-      targetUrl = FALLBACK_URL;
+    }
+
+    let targetUrl = await resolveTargetUrl();
+    if (targetUrl !== FALLBACK_URL) {
+      const targetUrlObj = new URL(targetUrl);
+      url.searchParams.forEach((value, key) => targetUrlObj.searchParams.set(key, value));
+      targetUrl = targetUrlObj.toString();
     }
 
     try {
       const result = await proxyDynamic206(targetUrl, req);
+
+      // Link cache bị chết (403/404) -> xoá cache, resolve lại URL mới, thử lại ngay
+      if (result.status === 403 || result.status === 404) {
+        if (DEBUG) console.warn(`[CACHE EXPIRED] Link chết cho ${filename}, resolve lại...`);
+        invalidateCachedTargetUrl(filename);
+        const freshUrl = await resolveTargetUrl();
+        const retryResult = await proxyDynamic206(freshUrl, req);
+        sendWebResult(res, retryResult);
+        return;
+      }
+
       sendWebResult(res, result);
     } catch (err) {
       if (DEBUG) console.error(`[PROXY ERROR] ${err.message}`);
