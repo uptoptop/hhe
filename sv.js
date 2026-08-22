@@ -142,13 +142,17 @@ async function proxyDynamic206(targetUrl, req, signal) {
 
   (async () => {
     const writer = writable.getWriter();
-    try {
-      const totalChunks = Math.ceil(requestedSize / chunkSize);
-      let nextChunkToFetch = 0;
-      let nextChunkToWrite = 0;
-      const pendingFetches = new Map();
-      const HARD_CAP_PER_CHUNK = chunkSize * 2;
+    // Khai báo NGOÀI try -> để "finally" bên dưới truy cập được. try{} và finally{}
+    // là 2 block scope RIÊNG BIỆT trong JS: const/let khai báo trong try KHÔNG
+    // được nhìn thấy trong finally -> gây ReferenceError: pendingFetches is not defined
+    // (đây chính là lỗi bạn vừa gặp trên Railway).
+    const totalChunks = Math.ceil(requestedSize / chunkSize);
+    let nextChunkToFetch = 0;
+    let nextChunkToWrite = 0;
+    const pendingFetches = new Map();
+    const HARD_CAP_PER_CHUNK = chunkSize * 2;
 
+    try {
       const launchFetch = (chunkIndex) => {
         const chunkStart = startByte + chunkIndex * chunkSize;
         if (chunkStart > endByte) return null;
@@ -220,10 +224,17 @@ async function proxyDynamic206(targetUrl, req, signal) {
 
   const responseHeaders = buildResponseHeaders(headResp.headers, targetUrl);
   responseHeaders.set('Accept-Ranges', 'bytes');
-  responseHeaders.set('Content-Range', `bytes ${startByte}-${endByte}/${totalFileSize || '*'}`);
   responseHeaders.set('Content-Length', requestedSize.toString());
 
-  return { status: 206, statusText: 'Partial Content', headers: responseHeaders, webStream: readable };
+  // Chỉ trả 206 + Content-Range khi client THỰC SỰ gửi Range (đúng chuẩn HTTP).
+  // Không có Range -> 200 OK cho toàn bộ nội dung. Nhiều native player (Android
+  // ExoPlayer / iOS AVPlayer qua Flutter) strict theo chuẩn này hơn browser.
+  if (clientRange) {
+    responseHeaders.set('Content-Range', `bytes ${startByte}-${endByte}/${totalFileSize || '*'}`);
+    return { status: 206, statusText: 'Partial Content', headers: responseHeaders, webStream: readable };
+  }
+
+  return { status: 200, statusText: 'OK', headers: responseHeaders, webStream: readable };
 }
 
 async function fetchStandard(targetUrl, headers, originalUrl, signal) {
@@ -273,7 +284,7 @@ function sendWebResult(res, result, signal) {
   }
   if (result.webStream) {
     const nodeStream = Readable.fromWeb(result.webStream);
-    
+
     // Hủy Stream ngay lập tức nếu Abort Signal được bật
     const onAbort = () => {
       nodeStream.destroy();
