@@ -295,6 +295,16 @@ function sendWebResult(res, result, signal) {
       signal.removeEventListener('abort', onAbort);
     });
 
+    // Origin đóng kết nối giữa chừng (mất mạng, timeout...) -> stream bắn 'error'.
+    // Không có listener này thì Node coi là uncaught exception (lưới an toàn global
+    // vẫn bắt được nên không crash cả server, nhưng nên đóng sạch response cho client
+    // thay vì để client treo chờ vô thời hạn).
+    nodeStream.on('error', (err) => {
+      if (DEBUG) console.warn(`[STREAM ERROR] ${err.message}`);
+      signal.removeEventListener('abort', onAbort);
+      if (!res.writableEnded) res.destroy();
+    });
+
     nodeStream.pipe(res);
     return;
   }
